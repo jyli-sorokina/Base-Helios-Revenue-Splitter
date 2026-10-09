@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract HeliosRevenueSplitter {
+    struct PayeeInfo {
+        uint256 shareUnits;
+        uint256 totalReleased;
+        bool exists;
+    }
+
+    address payable public immutable splitterOwner;
+    string public splitterTag;
+    uint256 public totalShareUnits;
+    uint256 public totalRevenueReceived;
+    uint256 public totalRevenueDistributed;
+
+    mapping(address => PayeeInfo) public payees;
+
+    event PayeeRegistered(address indexed payee, uint256 shares);
+    event RevenueClaimed(address indexed payee, uint256 amount);
+    event RevenueStreamFunded(address indexed funder, uint256 amount);
+    event EmergencyFundsSwept(address indexed owner, uint256 amount);
+    event PayeeSharesRebalanced(address indexed payee, uint256 oldShares, uint256 newShares);
+    event PayeeRightsTransferred(address indexed previousPayee, address indexed newPayee);
+    event SplitterTagChanged(string newTag);
+    event ResidualWithdrawn(address indexed owner, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == splitterOwner, "HeliosSplitter: Access denied");
+        _;
+    }
+
+    constructor() {
+        splitterOwner = payable(msg.sender);
+        splitterTag = "Helios Base Dynamic Revenue Splitter v1";
+    }
+
+    // 1. addPayeeShare
+    function addPayeeShare(address payee, uint256 shares) external onlyOwner {
+        require(payee != address(0), "HeliosSplitter: Zero address");
+        require(shares > 0, "HeliosSplitter: Zero shares");
+        require(!payees[payee].exists, "HeliosSplitter: Payee already exists");
+
+        payees[payee] = PayeeInfo({
+            shareUnits: shares,
+            totalReleased: 0,
+            exists: true
+        });
+
+        totalShareUnits += shares;
+        emit PayeeRegistered(payee, shares);
+    }
+
+    // 2. claimPayeeRevenue
+    function claimPayeeRevenue() external {
+        PayeeInfo storage p = payees[msg.sender];
+        require(p.exists, "HeliosSplitter: Not registered payee");
+        require(p.shareUnits > 0, "HeliosSplitter: No shares assigned");
+
+        uint256 totalReceived = totalRevenueReceived;
+        uint256 paymentDue = (totalReceived * p.shareUnits) / totalShareUnits - p.totalReleased;
+        require(paymentDue > 0, "HeliosSplitter: No funds due");
+
+        p.totalReleased += paymentDue;
+        totalRevenueDistributed += paymentDue;
+
+        (bool sent, ) = payable(msg.sender).call{value: paymentDue}("");
+        require(sent, "HeliosSplitter: Payout failed");
+
+        emit RevenueClaimed(msg.sender, paymentDue);
+    }
+
+    // 3. depositRevenueStream
+    function depositRevenueStream() external payable {
+        require(msg.value > 0, "HeliosSplitter: Zero deposit value");
+        require(totalShareUnits > 0, "HeliosSplitter: No payees registered yet");
+
+        totalRevenueReceived += msg.value;
+        emit RevenueStreamFunded(msg.sender, msg.value);
+    }
+
+    // 4. emergencySweep
+    function emergencySweep() external onlyOwner {
+        uint256 unallocated = address(this).balance > (totalRevenueReceived - totalRevenueDistributed)
+            ? address(this).balance - (totalRevenueReceived - totalRevenueDistributed)
+            : 0;
+            
+        if (unallocated == 0 && address(this).balance > 0 && totalShareUnits == 0) {
+            unallocated = address(this).balance;
+        }
+        require(unallocated > 0, "HeliosSplitter: Zero sweepable funds");
+
+        (bool sent, ) = splitterOwner.call{value: unallocated}("");
+        require(sent, "HeliosSplitter: Sweep failed");
+
+        emit EmergencyFundsSwept(splitterOwner, unallocated);
+    }
+
+    // 5. rebalancePayeeAllocation
+    function rebalancePayeeAllocation(address payee, uint256 newShares) external onlyOwner {
+        PayeeInfo storage p = payees[payee];
+        require(p.exists, "HeliosSplitter: Payee not found");
+        require(newShares > 0, "HeliosSplitter: Shares must be > 0");
+
+        uint256 oldShares = p.shareUnits;
+        totalShareUnits = totalShareUnits - oldShares + newShares;
+        p.shareUnits = newShares;
+
+        emit PayeeSharesRebalanced(payee, oldShares, newShares);
+    }
+
+    // 6. transferPayeeRights
+    function transferPayeeRights(address newPayee) external {
+        require(newPayee != address(0), "HeliosSplitter: Zero address");
+        require(!payees[newPayee].exists, "HeliosSplitter: Recipient already payee");
+        PayeeInfo storage oldP = payees[msg.sender];
+        require(oldP.exists, "HeliosSplitter: Sender not payee");
+
+        payees[newPayee] = PayeeInfo({
+            shareUnits: oldP.shareUnits,
+            totalReleased: oldP.totalReleased,
+            exists: true
+        });
+
+        delete payees[msg.sender];
+        emit PayeeRightsTransferred(msg.sender, newPayee);
+    }
+
+    // 7. updateSplitterTag
+    function updateSplitterTag(string calldata newTag) external onlyOwner {
+        require(bytes(newTag).length > 0, "HeliosSplitter: Empty tag");
+        splitterTag = newTag;
+        emit SplitterTagChanged(newTag);
+    }
+
+    // 8. withdrawUnclaimedResidual
+    function withdrawUnclaimedResidual(uint256 amount) external onlyOwner {
+        require(amount <= address(this).balance && amount > 0, "HeliosSplitter: Invalid amount");
+
+        (bool sent, ) = splitterOwner.call{value: amount}("");
+        require(sent, "HeliosSplitter: Withdrawal failed");
+
+        emit ResidualWithdrawn(splitterOwner, amount);
+    }
+
+    // Чтение информации о дольщике
+    function getPayeeDetails(address payee) external view returns (uint256 shares, uint256 released, uint256 pending) {
+        PayeeInfo memory p = payees[payee];
+        if (!p.exists || totalShareUnits == 0) return (0, 0, 0);
+        uint256 due = (totalRevenueReceived * p.shareUnits) / totalShareUnits - p.totalReleased;
+        return (p.shareUnits, p.totalReleased, due);
+    }
+}
